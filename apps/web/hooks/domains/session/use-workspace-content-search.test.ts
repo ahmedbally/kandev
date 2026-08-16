@@ -14,6 +14,9 @@ vi.mock("@/lib/ws/workspace-files", () => ({
 
 import { useWorkspaceContentSearch } from "./use-workspace-content-search";
 
+/** Mirrors CONTENT_SEARCH_DEBOUNCE_MS in the hook. */
+const CONTENT_SEARCH_DEBOUNCE_MS = 250;
+
 beforeEach(() => {
   vi.useFakeTimers();
   mockSearchWorkspaceContent.mockReset();
@@ -249,5 +252,83 @@ describe("useWorkspaceContentSearch stale responses", () => {
     expect(mockSearchWorkspaceContent).toHaveBeenCalledTimes(9);
     expect(result.current.results).toEqual(secondResults);
     expect(result.current.isSearching).toBe(false);
+  });
+});
+
+describe("useWorkspaceContentSearch incremental results", () => {
+  it("shows the first attempt's results without waiting out the retry budget", async () => {
+    const early = {
+      repository_name: "primary",
+      path: "src/early.ts",
+      line: 1,
+      column: 1,
+      preview: "early needle",
+      match_ranges: [],
+    };
+    mockSearchWorkspaceContent.mockResolvedValue({ results: [early] });
+    const { result } = renderHook(() =>
+      useWorkspaceContentSearch({
+        enabled: true,
+        query: "needle",
+        sessionId: "session-1",
+      }),
+    );
+
+    // Past the debounce and the first response only, with the remaining
+    // attempts and their delays still outstanding.
+    await act(async () => vi.advanceTimersByTimeAsync(CONTENT_SEARCH_DEBOUNCE_MS));
+
+    expect(mockSearchWorkspaceContent).toHaveBeenCalledTimes(1);
+    expect(result.current.results).toEqual([early]);
+    expect(result.current.isSearching).toBe(true);
+
+    await act(async () => vi.runAllTimersAsync());
+    expect(result.current.results).toEqual([early]);
+    expect(result.current.isSearching).toBe(false);
+  });
+
+  it("drops a partial result published by a superseded query", async () => {
+    const staleResult = {
+      repository_name: "",
+      path: "stale.ts",
+      line: 1,
+      column: 1,
+      preview: "stale",
+      match_ranges: [],
+    };
+    const liveResult = {
+      repository_name: "",
+      path: "live.ts",
+      line: 1,
+      column: 1,
+      preview: "live",
+      match_ranges: [],
+    };
+    let resolveStale: ((value: { results: (typeof staleResult)[] }) => void) | undefined;
+    mockSearchWorkspaceContent
+      .mockImplementationOnce(
+        () =>
+          new Promise<{ results: (typeof staleResult)[] }>((resolve) => {
+            resolveStale = resolve;
+          }),
+      )
+      .mockResolvedValue({ results: [liveResult] });
+    const { result, rerender } = renderHook(
+      ({ query }) => useWorkspaceContentSearch({ enabled: true, query, sessionId: "session-1" }),
+      { initialProps: { query: "stale" } },
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+
+    rerender({ query: "live" });
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(result.current.results).toEqual([liveResult]);
+
+    // The superseded query's first attempt lands late. Only promises are
+    // flushed here, so the live query's next attempt cannot mask an overwrite.
+    await act(async () => {
+      resolveStale?.({ results: [staleResult] });
+    });
+
+    expect(result.current.results).toEqual([liveResult]);
   });
 });
